@@ -123,7 +123,8 @@ public class UnitySTTPlugin {
                 sendToUnity("OnSTTError", errorMessage);
 
                 if (isListening && (error == SpeechRecognizer.ERROR_NO_MATCH ||
-                                    error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT)) {
+                                    error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT ||
+                                    error == 11)) {
                     mainHandler.postDelayed(() -> {
                         if (isListening && recognizer != null) {
                             recognizer.startListening(createIntent(currentLanguage));
@@ -188,6 +189,14 @@ public class UnitySTTPlugin {
                 return "ERROR_SERVER";
             case SpeechRecognizer.ERROR_SPEECH_TIMEOUT:
                 return "ERROR_SPEECH_TIMEOUT";
+            case 10: // ERROR_TOO_MANY_REQUESTS (API 30+)
+                return "ERROR_TOO_MANY_REQUESTS";
+            case 11: // ERROR_SERVER_DISCONNECTED (API 30+)
+                return "ERROR_SERVER_DISCONNECTED";
+            case 12: // ERROR_LANGUAGE_NOT_SUPPORTED (API 31+)
+                return "ERROR_LANGUAGE_NOT_SUPPORTED";
+            case 13: // ERROR_LANGUAGE_UNAVAILABLE (API 31+)
+                return "ERROR_LANGUAGE_UNAVAILABLE";
             default:
                 return "ERROR_UNKNOWN_" + error;
         }
