@@ -20,7 +20,6 @@ public class STTTestCode : MonoBehaviour
         STTManager.Instance.OnStarted += () => statusText.text = "녹음 시작됨";
         STTManager.Instance.OnReady += () => statusText.text = "말씀하세요...";
         STTManager.Instance.OnStopped += () => statusText.text = "녹음 중지됨";
-
         STTManager.Instance.OnPartialResult += text =>
         {
             currentPartial = text;
@@ -37,16 +36,9 @@ public class STTTestCode : MonoBehaviour
             }
         };
 
-        STTManager.Instance.OnError += error => 
-        { 
-            if (error.Contains("NO_MATCH") || error.Contains("SPEECH_TIMEOUT"))
-            {
-                statusText.text = "계속 말씀하세요...";
-            }
-            else
-            {
-                statusText.text = $"에러: {error}"; 
-            }
+        STTManager.Instance.OnError += error =>
+        {
+            statusText.text = error;
         };
 
         // iOS 권한 콜백

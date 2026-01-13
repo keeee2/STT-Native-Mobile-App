@@ -19,6 +19,7 @@ public class UnitySTTPlugin {
     private Handler mainHandler;
     private String gameObjectName = "STTManager";
     private String currentLanguage = "ko-KR";
+    private boolean isCancelling = false;
 
     public static UnitySTTPlugin getInstance() {
         if (instance == null) {
@@ -56,12 +57,14 @@ public class UnitySTTPlugin {
 
     public void stopListening() {
         mainHandler.post(() -> {
+            isCancelling = true;
             isListening = false;
             if (recognizer != null) {
-                // recognizer.stopListening();
                 recognizer.cancel();
             }
+
             sendToUnity("OnSTTStopped", "");
+            mainHandler.postDelayed(() -> isCancelling = false, 200);
         });
     }
 
@@ -112,6 +115,10 @@ public class UnitySTTPlugin {
 
             @Override
             public void onError(int error) {
+                if (isCancelling) {
+                    return;
+                }
+
                 String errorMessage = getErrorMessage(error);
                 sendToUnity("OnSTTError", errorMessage);
 
@@ -182,7 +189,7 @@ public class UnitySTTPlugin {
             case SpeechRecognizer.ERROR_SPEECH_TIMEOUT:
                 return "ERROR_SPEECH_TIMEOUT";
             default:
-                return "ERROR_UNKNOWN";
+                return "ERROR_UNKNOWN_" + error;
         }
     }
 
