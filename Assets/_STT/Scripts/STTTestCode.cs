@@ -8,8 +8,8 @@ public class STTTestCode : MonoBehaviour
     [SerializeField] private TMP_Text statusText;
     [SerializeField] private TMP_Text resultText;
 
-    private bool isRecording = false;
-    private bool hasPermission = false;
+    private bool isRecording;
+    private bool hasPermission;
 
     private string accumulatedText = "";
     private string currentPartial = "";
