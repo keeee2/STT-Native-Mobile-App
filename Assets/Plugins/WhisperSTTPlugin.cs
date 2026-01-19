@@ -22,7 +22,7 @@ public class WhisperSTTPlugin : MonoBehaviour
 {
     // 모델 폴더 이름 (빌드 파일 옆에 수동으로 배치)
     public const string MODEL_FOLDER_NAME = "WhisperModels";
-    public const string DEFAULT_MODEL_NAME = "ggml-small.bin";
+    public const string DEFAULT_MODEL_NAME = "ggml-base.bin";
 
     [Header("Whisper 설정")]
     [Tooltip("Whisper 모델 파일명 (WhisperModels 폴더 내)")]
@@ -33,7 +33,7 @@ public class WhisperSTTPlugin : MonoBehaviour
 
     [Header("스트리밍 설정")]
     [Tooltip("스트리밍 스텝 간격 (초)")]
-    [SerializeField] private float stepSec = 3f;
+    [SerializeField] private float stepSec = 1f;
 
     [Tooltip("이전 세그먼트 유지 시간 (초)")]
     [SerializeField] private float keepSec = 0.2f;
@@ -206,7 +206,6 @@ public class WhisperSTTPlugin : MonoBehaviour
 
         Debug.Log($"[WhisperSTT] 모델 경로 확인됨: {fullModelPath}");
 
-        // ⭐ 비활성화 상태에서 WhisperManager 생성 (Awake 방지)
         var whisperGo = new GameObject("WhisperManager");
         whisperGo.SetActive(false);
         whisperGo.transform.SetParent(transform);
@@ -228,8 +227,6 @@ public class WhisperSTTPlugin : MonoBehaviour
 
         // 이벤트 구독
         _whisperManager.OnNewSegment += OnWhisperNewSegment;
-
-        // ⭐ 이제 활성화 → Awake 호출 → 설정된 경로로 InitModel 실행
         whisperGo.SetActive(true);
 
         Debug.Log("[WhisperSTT] 모델 로딩 시작...");
