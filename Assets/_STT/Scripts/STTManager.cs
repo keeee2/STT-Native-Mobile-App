@@ -5,9 +5,8 @@ using System.Runtime.InteropServices;
 /// <summary>
 /// 통합 STT Manager
 /// - Android: 네이티브 SpeechRecognizer
-/// - iOS: Speech Framework
-/// - Windows: System.Speech (SAPI)
-/// - macOS: Speech Framework (10.15+)
+/// - iOS: Speech Framework  
+/// - Windows/macOS/Editor: whisper.unity
 /// 
 /// 게임오브젝트 이름: "STTManager"
 /// </summary>
@@ -40,8 +39,7 @@ public class STTManager : MonoBehaviour
         None,
         AndroidNative,
         iOSNative,
-        WindowsNative,
-        MacOSNative
+        Whisper
     }
 
     // ===== 플랫폼별 구현 =====
@@ -50,7 +48,7 @@ public class STTManager : MonoBehaviour
     private AndroidJavaObject androidPlugin;
 #endif
 
-#if (UNITY_IOS || UNITY_STANDALONE_OSX) && !UNITY_EDITOR
+#if UNITY_IOS && !UNITY_EDITOR
     [DllImport("__Internal")]
     private static extern void _STTSetGameObjectName(string name);
     
@@ -64,8 +62,9 @@ public class STTManager : MonoBehaviour
     private static extern void _STTStopListening();
 #endif
 
-#if UNITY_STANDALONE_WIN && !UNITY_EDITOR
-    private WindowsSTTPlugin windowsPlugin;
+    // Whisper 플러그인 (Editor/Standalone용)
+#if UNITY_EDITOR || UNITY_STANDALONE
+    private WhisperSTTPlugin whisperPlugin;
 #endif
 
     private void Awake()
@@ -88,14 +87,8 @@ public class STTManager : MonoBehaviour
         InitializeAndroid();
 #elif UNITY_IOS && !UNITY_EDITOR
         InitializeiOS();
-#elif UNITY_STANDALONE_OSX && !UNITY_EDITOR
-        InitializeMacOS();
-#elif UNITY_STANDALONE_WIN && !UNITY_EDITOR
-        InitializeWindows();
-#elif UNITY_EDITOR_WIN
-        InitializeWindowsEditor();
-#elif UNITY_EDITOR_OSX
-        InitializeMacOSEditor();
+#elif UNITY_EDITOR || UNITY_STANDALONE
+        InitializeWhisper();
 #else
         Debug.LogWarning("[STTManager] 지원되지 않는 플랫폼");
 #endif
@@ -139,133 +132,51 @@ public class STTManager : MonoBehaviour
     }
 #endif
 
-#if UNITY_STANDALONE_OSX && !UNITY_EDITOR
-    private void InitializeMacOS()
+#if UNITY_EDITOR || UNITY_STANDALONE
+    private void InitializeWhisper()
     {
         try
         {
-            _STTSetGameObjectName(gameObject.name);
-            CurrentBackend = STTBackend.MacOSNative;
-            IsInitialized = true;
-            Debug.Log("[STTManager] macOS Speech Framework 초기화 완료");
-        }
-        catch (Exception e)
-        {
-            Debug.LogError($"[STTManager] macOS 초기화 실패: {e.Message}");
-        }
-    }
-#endif
-
-#if UNITY_STANDALONE_WIN && !UNITY_EDITOR
-    private void InitializeWindows()
-    {
-        try
-        {
-            // MainThread Dispatcher 초기화 (SAPI 콜백용)
-            MainThreadDispatcher.Initialize();
+            whisperPlugin = gameObject.AddComponent<WhisperSTTPlugin>();
             
-            windowsPlugin = WindowsSTTPlugin.GetInstance();
+            // Whisper 이벤트 연결
+            whisperPlugin.OnStarted += () => OnSTTStarted("");
+            whisperPlugin.OnReady += () => OnSTTReady("");
+            whisperPlugin.OnStopped += () => OnSTTStopped("");
+            whisperPlugin.OnPartialResult += (text) => OnSTTPartialResult(text);
+            whisperPlugin.OnResult += (text) => OnSTTResult(text);
+            whisperPlugin.OnError += (error) => OnSTTError(error);
             
-            // 이벤트 연결
-            windowsPlugin.OnStarted += () => OnSTTStarted("");
-            windowsPlugin.OnReady += () => OnSTTReady("");
-            windowsPlugin.OnStopped += () => OnSTTStopped("");
-            windowsPlugin.OnPartialResult += (text) => OnSTTPartialResult(text);
-            windowsPlugin.OnResult += (text) => OnSTTResult(text);
-            windowsPlugin.OnError += (error) => OnSTTError(error);
-            
-            // 기본 언어로 초기화 시도
-            if (windowsPlugin.Initialize("ko-KR"))
+            // Whisper 초기화는 비동기로 진행됨
+            whisperPlugin.OnInitialized += (success) =>
             {
-                CurrentBackend = STTBackend.WindowsNative;
-                IsInitialized = true;
-                Debug.Log("[STTManager] Windows SAPI 초기화 완료");
-            }
-            else
-            {
-                // 한국어 실패 시 영어로 시도
-                if (windowsPlugin.Initialize("en-US"))
+                if (success)
                 {
-                    CurrentBackend = STTBackend.WindowsNative;
+                    CurrentBackend = STTBackend.Whisper;
                     IsInitialized = true;
-                    Debug.Log("[STTManager] Windows SAPI 초기화 완료 (en-US)");
+                    Debug.Log("[STTManager] Whisper 초기화 완료");
                 }
                 else
                 {
-                    Debug.LogError("[STTManager] Windows SAPI 초기화 실패 - 음성 인식 언어 팩 확인 필요");
+                    Debug.LogError("[STTManager] Whisper 초기화 실패");
                 }
-            }
+            };
+            
+            whisperPlugin.Initialize();
         }
         catch (Exception e)
         {
-            Debug.LogError($"[STTManager] Windows 초기화 실패: {e.Message}");
+            Debug.LogError($"[STTManager] Whisper 초기화 실패: {e.Message}");
         }
-    }
-#endif
-
-#if UNITY_EDITOR_WIN
-    private WindowsSTTPlugin windowsPluginEditor;
-
-    private void InitializeWindowsEditor()
-    {
-        try
-        {
-            // MainThread Dispatcher 초기화 (SAPI 콜백용)
-            MainThreadDispatcher.Initialize();
-
-            windowsPluginEditor = WindowsSTTPlugin.GetInstance();
-
-            // 이벤트 연결
-            windowsPluginEditor.OnStarted += () => OnSTTStarted("");
-            windowsPluginEditor.OnReady += () => OnSTTReady("");
-            windowsPluginEditor.OnStopped += () => OnSTTStopped("");
-            windowsPluginEditor.OnPartialResult += (text) => OnSTTPartialResult(text);
-            windowsPluginEditor.OnResult += (text) => OnSTTResult(text);
-            windowsPluginEditor.OnError += (error) => OnSTTError(error);
-
-            // 기본 언어로 초기화 시도
-            if (windowsPluginEditor.Initialize("ko-KR"))
-            {
-                CurrentBackend = STTBackend.WindowsNative;
-                IsInitialized = true;
-                Debug.Log("[STTManager] Windows Editor SAPI 초기화 완료");
-            }
-            else if (windowsPluginEditor.Initialize("en-US"))
-            {
-                CurrentBackend = STTBackend.WindowsNative;
-                IsInitialized = true;
-                Debug.Log("[STTManager] Windows Editor SAPI 초기화 완료 (en-US)");
-            }
-            else
-            {
-                Debug.LogError("[STTManager] Windows SAPI 초기화 실패 - 음성 인식 언어 팩 확인 필요");
-            }
-        }
-        catch (Exception e)
-        {
-            Debug.LogError($"[STTManager] Windows Editor 초기화 실패: {e.Message}");
-        }
-    }
-#endif
-
-#if UNITY_EDITOR_OSX
-    private void InitializeMacOSEditor()
-    {
-        // Editor에서는 네이티브 플러그인 사용 불가
-        Debug.LogWarning("[STTManager] macOS Editor에서는 STT 테스트 불가 - 빌드 후 테스트하세요");
-        CurrentBackend = STTBackend.None;
-        IsInitialized = false;
     }
 #endif
 
     /// <summary>
-    /// 권한 요청 (iOS/macOS에서 필요, 다른 플랫폼은 자동 처리)
+    /// 권한 요청 (iOS에서 필요, 다른 플랫폼은 자동 처리)
     /// </summary>
     public void RequestPermission()
     {
 #if UNITY_IOS && !UNITY_EDITOR
-        _STTRequestPermission();
-#elif UNITY_STANDALONE_OSX && !UNITY_EDITOR
         _STTRequestPermission();
 #elif UNITY_ANDROID && !UNITY_EDITOR
         // Android는 별도의 PermissionHelper 사용 권장
@@ -279,7 +190,7 @@ public class STTManager : MonoBehaviour
     /// <summary>
     /// STT 시작
     /// </summary>
-    /// <param name="languageCode">언어 코드 (예: "ko-KR", "en-US")</param>
+    /// <param name="languageCode">언어 코드 (예: "ko-KR", "en-US", "ko", "en")</param>
     public void StartListening(string languageCode = "ko-KR")
     {
         if (!IsInitialized)
@@ -294,14 +205,8 @@ public class STTManager : MonoBehaviour
         androidPlugin?.Call("startListening", languageCode);
 #elif UNITY_IOS && !UNITY_EDITOR
         _STTStartListening(languageCode);
-#elif UNITY_STANDALONE_OSX && !UNITY_EDITOR
-        _STTStartListening(languageCode);
-#elif UNITY_STANDALONE_WIN && !UNITY_EDITOR
-        windowsPlugin?.StartListening(languageCode);
-#elif UNITY_EDITOR_WIN
-        windowsPluginEditor?.StartListening(languageCode);
-#else
-        OnError?.Invoke("현재 플랫폼에서는 STT를 사용할 수 없습니다");
+#elif UNITY_EDITOR || UNITY_STANDALONE
+        whisperPlugin?.StartListening(languageCode);
 #endif
     }
 
@@ -314,37 +219,8 @@ public class STTManager : MonoBehaviour
         androidPlugin?.Call("stopListening");
 #elif UNITY_IOS && !UNITY_EDITOR
         _STTStopListening();
-#elif UNITY_STANDALONE_OSX && !UNITY_EDITOR
-        _STTStopListening();
-#elif UNITY_STANDALONE_WIN && !UNITY_EDITOR
-        windowsPlugin?.StopListening();
-#elif UNITY_EDITOR_WIN
-        windowsPluginEditor?.StopListening();
-#endif
-    }
-
-    /// <summary>
-    /// 특정 언어 지원 여부 확인 (Windows 전용)
-    /// </summary>
-    public bool IsLanguageSupported(string languageCode)
-    {
-#if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
-        return WindowsSTTPlugin.IsLanguageSupported(languageCode);
-#else
-        // 다른 플랫폼은 대부분의 주요 언어 지원
-        return true;
-#endif
-    }
-
-    /// <summary>
-    /// 설치된 언어 목록 (Windows 전용)
-    /// </summary>
-    public string[] GetInstalledLanguages()
-    {
-#if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
-        return WindowsSTTPlugin.GetInstalledLanguages();
-#else
-        return new string[] { "ko-KR", "en-US", "ja-JP", "zh-CN" };
+#elif UNITY_EDITOR || UNITY_STANDALONE
+        whisperPlugin?.StopListening();
 #endif
     }
 
@@ -359,18 +235,12 @@ public class STTManager : MonoBehaviour
         }
 #endif
 
-#if UNITY_STANDALONE_WIN && !UNITY_EDITOR
-        windowsPlugin?.Dispose();
-#elif UNITY_EDITOR_WIN
-        windowsPluginEditor?.Dispose();
-#endif
-
         if (Instance == this)
             Instance = null;
     }
 
-    // ===== 네이티브에서 호출되는 콜백들 (Android/iOS/macOS) =====
-    // Windows는 이벤트로 직접 연결됨
+    // ===== 네이티브에서 호출되는 콜백들 (Android/iOS) =====
+    // Whisper는 이벤트로 직접 연결됨
 
     private void OnSTTStarted(string message)
     {

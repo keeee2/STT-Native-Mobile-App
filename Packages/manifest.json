@@ -1,5 +1,6 @@
 {
   "dependencies": {
+    "com.mopsicus.umi": "https://github.com/mopsicus/umi.git",
     "com.unity.collab-proxy": "2.10.2",
     "com.unity.feature.2d": "2.0.1",
     "com.unity.ide.rider": "3.0.38",
@@ -11,6 +12,7 @@
     "com.unity.timeline": "1.8.9",
     "com.unity.ugui": "2.0.0",
     "com.unity.visualscripting": "1.9.7",
+    "com.whisper.unity": "https://github.com/Macoron/whisper.unity.git?path=/Packages/com.whisper.unity",
     "com.unity.modules.accessibility": "1.0.0",
     "com.unity.modules.ai": "1.0.0",
     "com.unity.modules.androidjni": "1.0.0",
@@ -42,7 +44,6 @@
     "com.unity.modules.video": "1.0.0",
     "com.unity.modules.vr": "1.0.0",
     "com.unity.modules.wind": "1.0.0",
-    "com.unity.modules.xr": "1.0.0",
-    "com.mopsicus.umi": "https://github.com/mopsicus/umi.git"
+    "com.unity.modules.xr": "1.0.0"
   }
 }

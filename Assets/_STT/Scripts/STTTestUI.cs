@@ -82,8 +82,7 @@ public class STTTestUI : MonoBehaviour
             {
                 STTManager.STTBackend.AndroidNative => "Android Native STT",
                 STTManager.STTBackend.iOSNative => "iOS Speech Framework",
-                STTManager.STTBackend.WindowsNative => "Windows Native STT",
-                STTManager.STTBackend.MacOSNative => "MacOS Native STT",
+                STTManager.STTBackend.Whisper => "Standalone STT",
                 _ => "초기화 중..."
             };
 
