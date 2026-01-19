@@ -5,14 +5,23 @@ using System.Runtime.InteropServices;
 /// <summary>
 /// 통합 STT Manager
 /// - Android: 네이티브 SpeechRecognizer
-/// - iOS: Speech Framework  
+/// - iOS: Speech Framework
 /// - Windows/macOS/Editor: whisper.unity
-/// 
+///
 /// 게임오브젝트 이름: "STTManager"
 /// </summary>
 public class STTManager : MonoBehaviour
 {
     public static STTManager Instance { get; private set; }
+
+    [Header("Debug")]
+    [Tooltip("Partial 로그는 매우 자주 발생합니다. 필요할 때만 켜세요.")]
+    [SerializeField] private bool verboseLogs = false;
+
+    [Tooltip("Partial 로그 최소 간격(초)")]
+    [SerializeField] private float partialLogThrottleSec = 0.25f;
+
+    private float _lastPartialLogTime = -999f;
 
     // 공통 이벤트들
     public event Action OnStarted;
@@ -51,13 +60,13 @@ public class STTManager : MonoBehaviour
 #if UNITY_IOS && !UNITY_EDITOR
     [DllImport("__Internal")]
     private static extern void _STTSetGameObjectName(string name);
-    
+
     [DllImport("__Internal")]
     private static extern void _STTRequestPermission();
-    
+
     [DllImport("__Internal")]
     private static extern void _STTStartListening(string languageCode);
-    
+
     [DllImport("__Internal")]
     private static extern void _STTStopListening();
 #endif
@@ -65,6 +74,29 @@ public class STTManager : MonoBehaviour
     // Whisper 플러그인 (Editor/Standalone용)
 #if UNITY_EDITOR || UNITY_STANDALONE
     private WhisperSTTPlugin whisperPlugin;
+
+    // Whisper 이벤트 핸들러(구독/해제를 안전하게 하기 위해 메서드로 보관)
+    private void HandleWhisperStarted() => OnSTTStarted(string.Empty);
+    private void HandleWhisperReady() => OnSTTReady(string.Empty);
+    private void HandleWhisperStopped() => OnSTTStopped(string.Empty);
+    private void HandleWhisperPartial(string text) => OnSTTPartialResult(text);
+    private void HandleWhisperFinal(string text) => OnSTTResult(text);
+    private void HandleWhisperError(string error) => OnSTTError(error);
+
+    private void HandleWhisperInitialized(bool success)
+    {
+        if (success)
+        {
+            CurrentBackend = STTBackend.Whisper;
+            IsInitialized = true;
+            if (verboseLogs) Debug.Log("[STTManager] Whisper 초기화 완료");
+        }
+        else
+        {
+            IsInitialized = false;
+            Debug.LogError("[STTManager] Whisper 초기화 실패");
+        }
+    }
 #endif
 
     private void Awake()
@@ -106,7 +138,7 @@ public class STTManager : MonoBehaviour
             }
             CurrentBackend = STTBackend.AndroidNative;
             IsInitialized = true;
-            Debug.Log("[STTManager] Android 네이티브 초기화 완료");
+            if (verboseLogs) Debug.Log("[STTManager] Android 네이티브 초기화 완료");
         }
         catch (Exception e)
         {
@@ -123,7 +155,7 @@ public class STTManager : MonoBehaviour
             _STTSetGameObjectName(gameObject.name);
             CurrentBackend = STTBackend.iOSNative;
             IsInitialized = true;
-            Debug.Log("[STTManager] iOS 네이티브 초기화 완료");
+            if (verboseLogs) Debug.Log("[STTManager] iOS 네이티브 초기화 완료");
         }
         catch (Exception e)
         {
@@ -137,31 +169,21 @@ public class STTManager : MonoBehaviour
     {
         try
         {
-            whisperPlugin = gameObject.AddComponent<WhisperSTTPlugin>();
-            
-            // Whisper 이벤트 연결
-            whisperPlugin.OnStarted += () => OnSTTStarted("");
-            whisperPlugin.OnReady += () => OnSTTReady("");
-            whisperPlugin.OnStopped += () => OnSTTStopped("");
-            whisperPlugin.OnPartialResult += (text) => OnSTTPartialResult(text);
-            whisperPlugin.OnResult += (text) => OnSTTResult(text);
-            whisperPlugin.OnError += (error) => OnSTTError(error);
-            
+            // 중복 AddComponent 방지
+            whisperPlugin = gameObject.GetComponent<WhisperSTTPlugin>();
+            if (whisperPlugin == null)
+                whisperPlugin = gameObject.AddComponent<WhisperSTTPlugin>();
+
+            // Whisper 이벤트 연결 (람다 금지: 해제 불가)
+            whisperPlugin.OnStarted += HandleWhisperStarted;
+            whisperPlugin.OnReady += HandleWhisperReady;
+            whisperPlugin.OnStopped += HandleWhisperStopped;
+            whisperPlugin.OnPartialResult += HandleWhisperPartial;
+            whisperPlugin.OnResult += HandleWhisperFinal;
+            whisperPlugin.OnError += HandleWhisperError;
+            whisperPlugin.OnInitialized += HandleWhisperInitialized;
+
             // Whisper 초기화는 비동기로 진행됨
-            whisperPlugin.OnInitialized += (success) =>
-            {
-                if (success)
-                {
-                    CurrentBackend = STTBackend.Whisper;
-                    IsInitialized = true;
-                    Debug.Log("[STTManager] Whisper 초기화 완료");
-                }
-                else
-                {
-                    Debug.LogError("[STTManager] Whisper 초기화 실패");
-                }
-            };
-            
             whisperPlugin.Initialize();
         }
         catch (Exception e)
@@ -235,6 +257,20 @@ public class STTManager : MonoBehaviour
         }
 #endif
 
+#if UNITY_EDITOR || UNITY_STANDALONE
+        if (whisperPlugin != null)
+        {
+            // 이벤트 구독 해제
+            whisperPlugin.OnStarted -= HandleWhisperStarted;
+            whisperPlugin.OnReady -= HandleWhisperReady;
+            whisperPlugin.OnStopped -= HandleWhisperStopped;
+            whisperPlugin.OnPartialResult -= HandleWhisperPartial;
+            whisperPlugin.OnResult -= HandleWhisperFinal;
+            whisperPlugin.OnError -= HandleWhisperError;
+            whisperPlugin.OnInitialized -= HandleWhisperInitialized;
+        }
+#endif
+
         if (Instance == this)
             Instance = null;
     }
@@ -245,46 +281,55 @@ public class STTManager : MonoBehaviour
     private void OnSTTStarted(string message)
     {
         IsListening = true;
-        Debug.Log("[STTManager] Started");
+        if (verboseLogs) Debug.Log("[STTManager] Started");
         OnStarted?.Invoke();
     }
 
     private void OnSTTReady(string message)
     {
-        Debug.Log("[STTManager] Ready for speech");
+        if (verboseLogs) Debug.Log("[STTManager] Ready for speech");
         OnReady?.Invoke();
     }
 
     private void OnSTTBeginning(string message)
     {
-        Debug.Log("[STTManager] Speech beginning");
+        if (verboseLogs) Debug.Log("[STTManager] Speech beginning");
         OnBeginning?.Invoke();
     }
 
     private void OnSTTEndOfSpeech(string message)
     {
-        Debug.Log("[STTManager] End of speech");
+        if (verboseLogs) Debug.Log("[STTManager] End of speech");
         OnEndOfSpeech?.Invoke();
     }
 
     private void OnSTTStopped(string message)
     {
         IsListening = false;
-        Debug.Log("[STTManager] Stopped");
+        if (verboseLogs) Debug.Log("[STTManager] Stopped");
         OnStopped?.Invoke();
     }
 
     private void OnSTTPartialResult(string text)
     {
         CurrentText = text;
-        Debug.Log($"[STTManager] Partial: {text}");
+
+        if (verboseLogs)
+        {
+            if (Time.realtimeSinceStartup - _lastPartialLogTime >= partialLogThrottleSec)
+            {
+                _lastPartialLogTime = Time.realtimeSinceStartup;
+                Debug.Log($"[STTManager] Partial: {text}");
+            }
+        }
+
         OnPartialResult?.Invoke(text);
     }
 
     private void OnSTTResult(string text)
     {
         CurrentText = text;
-        Debug.Log($"[STTManager] Result: {text}");
+        if (verboseLogs) Debug.Log($"[STTManager] Result: {text}");
         OnResult?.Invoke(text);
     }
 
@@ -296,7 +341,7 @@ public class STTManager : MonoBehaviour
 
     private void OnSTTPermissionGranted(string message)
     {
-        Debug.Log("[STTManager] Permission granted");
+        if (verboseLogs) Debug.Log("[STTManager] Permission granted");
         OnPermissionGranted?.Invoke();
     }
 

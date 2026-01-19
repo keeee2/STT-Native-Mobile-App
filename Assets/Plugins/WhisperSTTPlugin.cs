@@ -1,6 +1,10 @@
 ﻿#if UNITY_EDITOR || UNITY_STANDALONE
 using System;
+using System.Collections;
+using System.Collections.Generic;
 using System.IO;
+using System.Reflection;
+using System.Threading.Tasks;
 using UnityEngine;
 using Whisper;
 using Whisper.Utils;
@@ -9,7 +13,7 @@ using Whisper.Utils;
 /// whisper.unity 래퍼 플러그인
 /// - WhisperManager + WhisperStream + MicrophoneRecord 통합
 /// - STTManager와 동일한 이벤트 인터페이스 제공
-/// 
+///
 /// 모델 위치:
 /// - Editor: 프로젝트폴더/WhisperModels/
 /// - Standalone: 실행파일옆/WhisperModels/
@@ -17,15 +21,15 @@ using Whisper.Utils;
 public class WhisperSTTPlugin : MonoBehaviour
 {
     // 모델 폴더 이름 (빌드 파일 옆에 수동으로 배치)
-    private const string MODEL_FOLDER_NAME = "WhisperModels";
-    private const string DEFAULT_MODEL_NAME = "ggml-small.bin";
+    public const string MODEL_FOLDER_NAME = "WhisperModels";
+    public const string DEFAULT_MODEL_NAME = "ggml-small.bin";
 
     [Header("Whisper 설정")]
     [Tooltip("Whisper 모델 파일명 (WhisperModels 폴더 내)")]
     [SerializeField] private string modelFileName = DEFAULT_MODEL_NAME;
 
     [Tooltip("GPU 가속 사용 (Vulkan/Metal)")]
-    [SerializeField] private bool useGpu = false;
+    [SerializeField] private bool useGpu = true;
 
     [Header("스트리밍 설정")]
     [Tooltip("스트리밍 스텝 간격 (초)")]
@@ -43,6 +47,22 @@ public class WhisperSTTPlugin : MonoBehaviour
     [Header("언어 설정")]
     [Tooltip("인식 언어 (ko, en, ja 등). 비워두면 자동 감지")]
     [SerializeField] private string defaultLanguage = "ko";
+
+    [Header("안전/성능")]
+    [Tooltip("모델 로딩 타임아웃(초). GPU/Vulkan 문제로 로딩이 끝없이 걸릴 때 대비")]
+    [SerializeField] private float modelLoadTimeoutSec = 60f;
+
+    [Tooltip("스트림 생성 타임아웃(ms)")]
+    [SerializeField] private int streamCreateTimeoutMs = 15000;
+
+    [Tooltip("Partial 결과 UI/이벤트 갱신 최소 간격(초). 스트리밍 콜백 폭주 방지")]
+    [SerializeField] private float partialThrottleSec = 0.10f;
+
+    [Tooltip("세그먼트 로그 출력")]
+    [SerializeField] private bool logSegments = false;
+
+    [Tooltip("Partial 로그 출력")]
+    [SerializeField] private bool logPartial = false;
 
     // 이벤트 (STTManager 인터페이스와 동일)
     public event Action<bool> OnInitialized;
@@ -67,6 +87,24 @@ public class WhisperSTTPlugin : MonoBehaviour
     private string _currentLanguage;
     private string _accumulatedText = "";
 
+    // Partial throttle
+    private float _lastPartialEmitTime = -999f;
+    private string _lastPartialText = "";
+    private string _pendingPartialText = null;
+
+    // Main thread dispatcher (콜백 스레드가 불명확할 때를 대비)
+    private readonly object _queueLock = new object();
+    private readonly Queue<Action> _mainThreadQueue = new Queue<Action>();
+    private readonly List<Action> _drainList = new List<Action>(64);
+
+    private bool _isDestroying;
+
+    // Stop 이벤트 중복 방지 + 강제 정리용
+    private bool _stopNotified;
+    private int _sessionId;
+    private Coroutine _forceCleanupCo;
+
+
     /// <summary>
     /// WhisperModels 폴더 경로 반환
     /// - Editor: 프로젝트 루트/WhisperModels/
@@ -78,7 +116,7 @@ public class WhisperSTTPlugin : MonoBehaviour
         // Editor: 프로젝트 루트 폴더 (Assets의 상위)
         return Path.Combine(Path.GetDirectoryName(Application.dataPath), MODEL_FOLDER_NAME);
 #else
-        // Standalone: 실행 파일 옆
+        // Standalone: 실행 파일 옆 (AppName_Data의 상위)
         return Path.Combine(Path.GetDirectoryName(Application.dataPath), MODEL_FOLDER_NAME);
 #endif
     }
@@ -96,11 +134,64 @@ public class WhisperSTTPlugin : MonoBehaviour
         StartCoroutine(InitializeCoroutine());
     }
 
-    private System.Collections.IEnumerator InitializeCoroutine()
+    private void EnqueueMainThread(Action action)
+    {
+        if (action == null) return;
+        lock (_queueLock)
+        {
+            _mainThreadQueue.Enqueue(action);
+        }
+    }
+
+    private void Update()
+    {
+        // Drain actions
+        _drainList.Clear();
+        lock (_queueLock)
+        {
+            while (_mainThreadQueue.Count > 0)
+            {
+                _drainList.Add(_mainThreadQueue.Dequeue());
+            }
+        }
+
+        for (int i = 0; i < _drainList.Count; i++)
+        {
+            try
+            {
+                _drainList[i]?.Invoke();
+            }
+            catch (Exception e)
+            {
+                Debug.LogException(e);
+            }
+        }
+
+        // Partial throttle: pending 처리
+        if (!string.IsNullOrEmpty(_pendingPartialText))
+        {
+            if (Time.realtimeSinceStartup - _lastPartialEmitTime >= partialThrottleSec)
+            {
+                var txt = _pendingPartialText;
+                _pendingPartialText = null;
+
+                _stopNotified = false;
+                _sessionId++;
+                if (_forceCleanupCo != null)
+                {
+                    StopCoroutine(_forceCleanupCo);
+                    _forceCleanupCo = null;
+                }
+
+                EmitPartialNow(txt);
+            }
+        }
+    }
+
+    private IEnumerator InitializeCoroutine()
     {
         // 모델 경로 확인
-        string modelFolderPath = GetModelFolderPath();
-        string fullModelPath = Path.Combine(modelFolderPath, modelFileName);
+        string fullModelPath = GetModelFilePath(modelFileName);
 
         if (!File.Exists(fullModelPath))
         {
@@ -117,7 +208,7 @@ public class WhisperSTTPlugin : MonoBehaviour
 
         // ⭐ 비활성화 상태에서 WhisperManager 생성 (Awake 방지)
         var whisperGo = new GameObject("WhisperManager");
-        whisperGo.SetActive(false); // 먼저 비활성화!
+        whisperGo.SetActive(false);
         whisperGo.transform.SetParent(transform);
         _whisperManager = whisperGo.AddComponent<WhisperManager>();
 
@@ -132,6 +223,9 @@ public class WhisperSTTPlugin : MonoBehaviour
         _whisperManager.lengthSec = lengthSec;
         _whisperManager.useVad = useVad;
 
+        // (가능하면) GPU 설정 적용
+        TryApplyWhisperManagerBool(_whisperManager, useGpu, "useGpu", "UseGpu", "useGPU", "UseGPU");
+
         // 이벤트 구독
         _whisperManager.OnNewSegment += OnWhisperNewSegment;
 
@@ -140,9 +234,20 @@ public class WhisperSTTPlugin : MonoBehaviour
 
         Debug.Log("[WhisperSTT] 모델 로딩 시작...");
 
-        // 모델 로드 완료 대기
+        float start = Time.realtimeSinceStartup;
         while (_whisperManager.IsLoading)
         {
+            if (modelLoadTimeoutSec > 0f && Time.realtimeSinceStartup - start > modelLoadTimeoutSec)
+            {
+                Debug.LogError("[WhisperSTT] 모델 로딩 타임아웃");
+                OnError?.Invoke("모델 로딩 타임아웃");
+                OnInitialized?.Invoke(false);
+
+                // 정리
+                SafeDestroyWhisperObjects();
+                yield break;
+            }
+
             yield return null;
         }
 
@@ -151,11 +256,16 @@ public class WhisperSTTPlugin : MonoBehaviour
             Debug.LogError("[WhisperSTT] 모델 로드 실패");
             OnError?.Invoke("모델 로드 실패");
             OnInitialized?.Invoke(false);
+            SafeDestroyWhisperObjects();
             yield break;
         }
 
-        // MicrophoneRecord 생성
-        _microphoneRecord = gameObject.AddComponent<MicrophoneRecord>();
+        // MicrophoneRecord 생성 (필요 시)
+        _microphoneRecord = gameObject.GetComponent<MicrophoneRecord>();
+        if (_microphoneRecord == null)
+        {
+            _microphoneRecord = gameObject.AddComponent<MicrophoneRecord>();
+        }
 
         Debug.Log("[WhisperSTT] 초기화 완료");
         OnInitialized?.Invoke(true);
@@ -179,20 +289,44 @@ public class WhisperSTTPlugin : MonoBehaviour
             return;
         }
 
+        if (_microphoneRecord == null)
+        {
+            _microphoneRecord = gameObject.AddComponent<MicrophoneRecord>();
+        }
+
         // 언어 코드 정규화 (ko-KR -> ko)
         _currentLanguage = NormalizeLanguageCode(languageCode);
         _whisperManager.language = _currentLanguage;
 
         // 누적 텍스트 초기화
         _accumulatedText = "";
+        _lastPartialText = "";
+        _pendingPartialText = null;
+
+        _stopNotified = false;
+        _sessionId++;
+        if (_forceCleanupCo != null)
+        {
+            StopCoroutine(_forceCleanupCo);
+            _forceCleanupCo = null;
+        }
 
         try
         {
             // 마이크 녹음 시작
             _microphoneRecord.StartRecord();
 
-            // WhisperStream 생성
-            _whisperStream = await _whisperManager.CreateStream(_microphoneRecord);
+            // WhisperStream 생성 (타임아웃)
+            var createTask = _whisperManager.CreateStream(_microphoneRecord);
+            var completed = await Task.WhenAny(createTask, Task.Delay(streamCreateTimeoutMs));
+            if (completed != createTask)
+            {
+                OnError?.Invoke("스트림 생성 타임아웃");
+                _microphoneRecord.StopRecord();
+                return;
+            }
+
+            _whisperStream = await createTask;
 
             if (_whisperStream == null)
             {
@@ -214,7 +348,7 @@ public class WhisperSTTPlugin : MonoBehaviour
             OnStarted?.Invoke();
             OnReady?.Invoke();
 
-            Debug.Log($"[WhisperSTT] 인식 시작 (언어: {_currentLanguage})");
+            Debug.Log($"[WhisperSTT] 인식 시작 (언어: {_currentLanguage}, GPU: {useGpu})");
         }
         catch (Exception e)
         {
@@ -231,66 +365,161 @@ public class WhisperSTTPlugin : MonoBehaviour
         if (!IsListening)
             return;
 
+        IsListening = false;
+
+        // Notify immediately for manual stop (deduped)
+        if (!_stopNotified)
+        {
+            _stopNotified = true;
+            OnStopped?.Invoke();
+        }
+
         try
         {
-            // 마이크 녹음 중지 (이게 StopStream도 트리거함)
+            // Stop stream explicitly if available
+            TryInvokeStopStream(_whisperStream);
+
+            // Stop microphone record (may also trigger StopStream)
             _microphoneRecord?.StopRecord();
         }
         catch (Exception e)
         {
-            Debug.LogError($"[WhisperSTT] 중지 실패: {e.Message}");
+            Debug.LogError($"[WhisperSTT] stop failed: {e.Message}");
         }
+
+        // Force cleanup if stream callbacks never arrive
+        if (_forceCleanupCo != null)
+            StopCoroutine(_forceCleanupCo);
+        _forceCleanupCo = StartCoroutine(ForceCleanupAfterDelay(_sessionId, 2f));
+    }
+
+    private IEnumerator ForceCleanupAfterDelay(int sessionId, float delaySec)
+    {
+        if (delaySec <= 0f)
+            yield break;
+
+        yield return new WaitForSecondsRealtime(delaySec);
+
+        if (_isDestroying)
+            yield break;
+
+        // If a new session started, do nothing
+        if (sessionId != _sessionId)
+            yield break;
+
+        // If still listening, do nothing
+        if (IsListening)
+            yield break;
+
+        CleanupStreamSubscriptions();
+        _forceCleanupCo = null;
     }
 
     // ===== Whisper 이벤트 핸들러 =====
 
     private void OnWhisperNewSegment(WhisperSegment segment)
     {
-        // 새 세그먼트 (실시간 콜백)
+        if (!logSegments || segment == null) return;
         Debug.Log($"[WhisperSTT] 새 세그먼트: {segment.Text}");
     }
 
     private void OnStreamResultUpdated(string updatedResult)
     {
-        // 전체 결과 업데이트 (partial)
-        if (!string.IsNullOrEmpty(updatedResult))
-        {
-            OnPartialResult?.Invoke(updatedResult.Trim());
-        }
+        if (_isDestroying) return;
+        if (string.IsNullOrWhiteSpace(updatedResult)) return;
+
+        var txt = updatedResult.Trim();
+        if (logPartial) Debug.Log($"[WhisperSTT] Partial(updated): {txt}");
+
+        EnqueueMainThread(() => EmitPartial(txt));
     }
 
     private void OnStreamSegmentUpdated(WhisperResult segment)
     {
-        // 세그먼트 업데이트 중
-        if (segment != null && !string.IsNullOrEmpty(segment.Result))
-        {
-            OnPartialResult?.Invoke(segment.Result.Trim());
-        }
+        if (_isDestroying) return;
+        if (segment == null || string.IsNullOrWhiteSpace(segment.Result)) return;
+
+        var txt = segment.Result.Trim();
+        if (logPartial) Debug.Log($"[WhisperSTT] Partial(segment): {txt}");
+
+        EnqueueMainThread(() => EmitPartial(txt));
     }
 
     private void OnStreamSegmentFinished(WhisperResult segment)
     {
-        // 세그먼트 완료 (final result for this segment)
-        if (segment != null && !string.IsNullOrEmpty(segment.Result))
-        {
-            string segmentText = segment.Result.Trim();
-            Debug.Log($"[WhisperSTT] 세그먼트 완료: {segmentText}");
+        if (_isDestroying) return;
+        if (segment == null || string.IsNullOrWhiteSpace(segment.Result)) return;
 
-            // 누적
+        string segmentText = segment.Result.Trim();
+
+        EnqueueMainThread(() =>
+        {
+            if (logSegments) Debug.Log($"[WhisperSTT] 세그먼트 완료: {segmentText}");
+
             if (!string.IsNullOrEmpty(_accumulatedText))
                 _accumulatedText += " ";
             _accumulatedText += segmentText;
 
             OnResult?.Invoke(segmentText);
-        }
+        });
     }
 
     private void OnStreamFinished(string finalResult)
     {
-        // 스트림 완전 종료
-        Debug.Log($"[WhisperSTT] 스트림 종료. 최종 결과: {finalResult}");
+        if (_isDestroying) return;
 
-        // 이벤트 구독 해제
+        EnqueueMainThread(() =>
+        {
+            if (logSegments) Debug.Log($"[WhisperSTT] 스트림 종료. 최종 결과: {finalResult}");
+
+            if (_forceCleanupCo != null)
+            {
+                StopCoroutine(_forceCleanupCo);
+                _forceCleanupCo = null;
+            }
+
+            CleanupStreamSubscriptions();
+            IsListening = false;
+
+            if (!_stopNotified)
+            {
+                _stopNotified = true;
+                OnStopped?.Invoke();
+            }
+        });
+    }
+
+    private void EmitPartial(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return;
+
+        var trimmed = text.Trim();
+
+        // 중복 방지
+        if (trimmed == _lastPartialText)
+            return;
+
+        // 스로틀
+        if (partialThrottleSec > 0f && Time.realtimeSinceStartup - _lastPartialEmitTime < partialThrottleSec)
+        {
+            _pendingPartialText = trimmed; // 최신 값으로 덮어쓰기
+            return;
+        }
+
+        EmitPartialNow(trimmed);
+    }
+
+    private void EmitPartialNow(string trimmed)
+    {
+        if (string.IsNullOrWhiteSpace(trimmed)) return;
+
+        _lastPartialText = trimmed;
+        _lastPartialEmitTime = Time.realtimeSinceStartup;
+        OnPartialResult?.Invoke(trimmed);
+    }
+
+    private void CleanupStreamSubscriptions()
+    {
         if (_whisperStream != null)
         {
             _whisperStream.OnResultUpdated -= OnStreamResultUpdated;
@@ -300,8 +529,15 @@ public class WhisperSTTPlugin : MonoBehaviour
             _whisperStream = null;
         }
 
-        IsListening = false;
-        OnStopped?.Invoke();
+        _pendingPartialText = null;
+
+        _stopNotified = false;
+        _sessionId++;
+        if (_forceCleanupCo != null)
+        {
+            StopCoroutine(_forceCleanupCo);
+            _forceCleanupCo = null;
+        }
     }
 
     /// <summary>
@@ -312,7 +548,6 @@ public class WhisperSTTPlugin : MonoBehaviour
         if (string.IsNullOrEmpty(code))
             return "auto";
 
-        // ISO 코드에서 언어 부분만 추출
         if (code.Contains("-"))
         {
             code = code.Split('-')[0];
@@ -321,17 +556,101 @@ public class WhisperSTTPlugin : MonoBehaviour
         return code.ToLower();
     }
 
+    private static void TryApplyWhisperManagerBool(object whisperManager, bool value, params string[] memberNames)
+    {
+        if (whisperManager == null || memberNames == null || memberNames.Length == 0)
+            return;
+
+        var t = whisperManager.GetType();
+        const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+
+        foreach (var name in memberNames)
+        {
+            try
+            {
+                var prop = t.GetProperty(name, flags);
+                if (prop != null && prop.PropertyType == typeof(bool) && prop.CanWrite)
+                {
+                    prop.SetValue(whisperManager, value);
+                    return;
+                }
+
+                var field = t.GetField(name, flags);
+                if (field != null && field.FieldType == typeof(bool))
+                {
+                    field.SetValue(whisperManager, value);
+                    return;
+                }
+            }
+            catch
+            {
+                // ignore
+            }
+        }
+
+        Debug.LogWarning("[WhisperSTT] WhisperManager에서 GPU 토글 멤버를 찾지 못했습니다. whisper.unity 버전/필드명을 확인하세요.");
+    }
+
+    private static void TryInvokeStopStream(object stream)
+    {
+        if (stream == null) return;
+
+        try
+        {
+            var t = stream.GetType();
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+            var m = t.GetMethod("StopStream", flags);
+            if (m != null && m.GetParameters().Length == 0)
+            {
+                m.Invoke(stream, null);
+            }
+        }
+        catch
+        {
+            // ignore
+        }
+    }
+
+    private void SafeDestroyWhisperObjects()
+    {
+        CleanupStreamSubscriptions();
+
+        if (_whisperManager != null)
+        {
+            _whisperManager.OnNewSegment -= OnWhisperNewSegment;
+            var go = _whisperManager.gameObject;
+            _whisperManager = null;
+            if (go != null)
+            {
+                Destroy(go);
+            }
+        }
+
+        if (_microphoneRecord != null)
+        {
+            try
+            {
+                _microphoneRecord.StopRecord();
+            }
+            catch
+            {
+                /* ignore */
+            }
+        }
+
+        IsListening = false;
+    }
+
     private void OnDestroy()
     {
+        _isDestroying = true;
+
         if (IsListening)
         {
             StopListening();
         }
 
-        if (_whisperManager != null)
-        {
-            _whisperManager.OnNewSegment -= OnWhisperNewSegment;
-        }
+        SafeDestroyWhisperObjects();
     }
 }
 #endif

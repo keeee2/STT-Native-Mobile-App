@@ -1,10 +1,11 @@
-﻿using TMPro;
+﻿using System.Collections;
+using TMPro;
 using UnityEngine;
 using UnityEngine.UI;
 
 /// <summary>
 /// STT 테스트 UI - 두 가지 모드 지원
-/// 
+///
 /// 1. Streaming: VAD 기반, 목소리 감지 → 침묵 감지 시 자동 전송 → 다시 대기
 /// 2. Recording: 버튼 누르면 녹음, 다시 누르면 전체를 STT 변환
 /// </summary>
@@ -19,6 +20,13 @@ public class STTTestCode : MonoBehaviour
     [Header("설정")]
     [SerializeField] private string languageCode = "ko-KR";
 
+    [Header("성능")]
+    [Tooltip("스트리밍 Partial 결과가 너무 자주 들어올 때 UI 갱신을 줄입니다(초)")]
+    [SerializeField] private float uiUpdateThrottleSec = 0.05f;
+
+    [Tooltip("Desktop/Editor에서 STT 초기화 대기 타임아웃(초)")]
+    [SerializeField] private float initTimeoutSec = 60f;
+
     // 상태
     private bool isStreamingMode = false;
     private bool isRecording = false;
@@ -29,21 +37,20 @@ public class STTTestCode : MonoBehaviour
     private string accumulatedText = "";
     private string currentPartial = "";
 
+    private float _lastUiUpdateTime = -999f;
+    private Coroutine _waitInitCo;
+
     private void Start()
     {
-        // 버튼 초기 비활성화
-        streamingButton.interactable = false;
-        recordButton.interactable = false;
-        statusText.text = "초기화 중...";
+        if (streamingButton != null) streamingButton.interactable = false;
+        if (recordButton != null) recordButton.interactable = false;
+        if (statusText != null) statusText.text = "초기화 중...";
 
-        // STTManager 이벤트 구독
         SubscribeEvents();
 
-        // 버튼 클릭 이벤트
-        streamingButton.onClick.AddListener(ToggleStreaming);
-        recordButton.onClick.AddListener(ToggleRecording);
+        if (streamingButton != null) streamingButton.onClick.AddListener(ToggleStreaming);
+        if (recordButton != null) recordButton.onClick.AddListener(ToggleRecording);
 
-        // 플랫폼별 초기화
         InitializePlatform();
     }
 
@@ -52,86 +59,66 @@ public class STTTestCode : MonoBehaviour
         var stt = STTManager.Instance;
         if (stt == null)
         {
-            statusText.text = "STTManager 없음!";
+            if (statusText != null) statusText.text = "STTManager 없음!";
             return;
         }
 
-        stt.OnStarted += () => { statusText.text = isStreamingMode ? "🎙️ 스트리밍 활성화" : "🔴 녹음 중..."; };
-
-        stt.OnReady += () =>
-        {
-            if (isStreamingMode)
-                statusText.text = "🎙️ 대기 중... (말씀하세요)";
-        };
-
-        stt.OnStopped += () =>
-        {
-            if (!isStreamingMode && !isRecording)
-                statusText.text = "녹음 완료";
-        };
-
-        stt.OnPartialResult += text =>
-        {
-            currentPartial = text;
-            UpdateResultText();
-
-            if (isStreamingMode)
-                statusText.text = "🎙️ 듣는 중...";
-        };
-
-        stt.OnResult += text =>
-        {
-            if (!string.IsNullOrEmpty(text))
-            {
-                // 누적
-                if (!string.IsNullOrEmpty(accumulatedText))
-                    accumulatedText += "\n";
-                accumulatedText += text;
-                currentPartial = "";
-                UpdateResultText();
-
-                Debug.Log($"[STT] 결과: {text}");
-
-                if (isStreamingMode)
-                    statusText.text = "🎙️ 대기 중... (말씀하세요)";
-            }
-        };
-
-        stt.OnError += error =>
-        {
-            statusText.text = $"오류: {error}";
-            Debug.LogWarning($"[STT] 오류: {error}");
-        };
-
+        // 람다 금지: 해제 불가
+        stt.OnStarted += HandleStarted;
+        stt.OnReady += HandleReady;
+        stt.OnStopped += HandleStopped;
+        stt.OnPartialResult += HandlePartial;
+        stt.OnResult += HandleFinal;
+        stt.OnError += HandleError;
         stt.OnPermissionGranted += OnPermissionGranted;
         stt.OnPermissionDenied += OnPermissionDenied;
+    }
+
+    private void UnsubscribeEvents()
+    {
+        var stt = STTManager.Instance;
+        if (stt == null) return;
+
+        stt.OnStarted -= HandleStarted;
+        stt.OnReady -= HandleReady;
+        stt.OnStopped -= HandleStopped;
+        stt.OnPartialResult -= HandlePartial;
+        stt.OnResult -= HandleFinal;
+        stt.OnError -= HandleError;
+        stt.OnPermissionGranted -= OnPermissionGranted;
+        stt.OnPermissionDenied -= OnPermissionDenied;
     }
 
     private void InitializePlatform()
     {
 #if UNITY_IOS && !UNITY_EDITOR
-        statusText.text = "권한 요청 중...";
+        if (statusText != null) statusText.text = "권한 요청 중...";
         STTManager.Instance.RequestPermission();
-
 #elif UNITY_ANDROID && !UNITY_EDITOR
-        statusText.text = "권한 요청 중...";
+        if (statusText != null) statusText.text = "권한 요청 중...";
         PermissionHelper.RequestMicrophonePermission(
             onGranted: OnPermissionGranted,
             onDenied: () => OnPermissionDenied("마이크 권한 거부")
         );
 #else
         // Editor/Standalone - Whisper 초기화 대기
-        StartCoroutine(WaitForInitialization());
+        _waitInitCo = StartCoroutine(WaitForInitialization());
 #endif
     }
 
-    private System.Collections.IEnumerator WaitForInitialization()
+    private IEnumerator WaitForInitialization()
     {
-        statusText.text = "Whisper 로딩 중...";
+        if (statusText != null) statusText.text = "Whisper 로딩 중...";
 
-        // STTManager 초기화 대기
+        float start = Time.realtimeSinceStartup;
         while (STTManager.Instance == null || !STTManager.Instance.IsInitialized)
         {
+            if (initTimeoutSec > 0f && Time.realtimeSinceStartup - start > initTimeoutSec)
+            {
+                if (statusText != null) statusText.text = "초기화 타임아웃(모델/GPU 설정 확인)";
+                yield break;
+            }
+
             yield return new WaitForSeconds(0.1f);
         }
 
@@ -142,9 +129,9 @@ public class STTTestCode : MonoBehaviour
     {
         hasPermission = true;
         isInitialized = true;
-        statusText.text = "✅ 준비 완료";
-        streamingButton.interactable = true;
-        recordButton.interactable = true;
+        if (statusText != null) statusText.text = "✅ 준비 완료";
+        if (streamingButton != null) streamingButton.interactable = true;
+        if (recordButton != null) recordButton.interactable = true;
 
         UpdateButtonTexts();
     }
@@ -152,7 +139,63 @@ public class STTTestCode : MonoBehaviour
     private void OnPermissionDenied(string reason)
     {
         hasPermission = false;
-        statusText.text = $"❌ 권한 거부: {reason}";
+        if (statusText != null) statusText.text = $"❌ 권한 거부: {reason}";
+
+        if (streamingButton != null) streamingButton.interactable = false;
+        if (recordButton != null) recordButton.interactable = false;
+    }
+
+    // ===== STT 이벤트 핸들러 =====
+
+    private void HandleStarted()
+    {
+        if (statusText == null) return;
+        statusText.text = isStreamingMode ? "🎙️ 스트리밍 활성화" : "🔴 녹음 중...";
+    }
+
+    private void HandleReady()
+    {
+        if (!isStreamingMode || statusText == null) return;
+        statusText.text = "🎙️ 대기 중... (말씀하세요)";
+    }
+
+    private void HandleStopped()
+    {
+        if (statusText == null) return;
+        if (!isStreamingMode && !isRecording)
+            statusText.text = "녹음 완료";
+    }
+
+    private void HandlePartial(string text)
+    {
+        currentPartial = text;
+        UpdateResultText();
+
+        if (isStreamingMode && statusText != null)
+            statusText.text = "🎙️ 듣는 중...";
+    }
+
+    private void HandleFinal(string text)
+    {
+        if (string.IsNullOrEmpty(text)) return;
+
+        if (!string.IsNullOrEmpty(accumulatedText))
+            accumulatedText += "\n";
+        accumulatedText += text;
+
+        currentPartial = "";
+        UpdateResultText(force: true);
+
+        Debug.Log($"[STT] 결과: {text}");
+
+        if (isStreamingMode && statusText != null)
+            statusText.text = "🎙️ 대기 중... (말씀하세요)";
+    }
+
+    private void HandleError(string error)
+    {
+        if (statusText != null) statusText.text = $"오류: {error}";
+        Debug.LogWarning($"[STT] 오류: {error}");
     }
 
     /// <summary>
@@ -164,33 +207,29 @@ public class STTTestCode : MonoBehaviour
     {
         if (!hasPermission || !isInitialized)
         {
-            statusText.text = "초기화 필요";
+            if (statusText != null) statusText.text = "초기화 필요";
             return;
         }
 
         if (!isStreamingMode)
         {
-            // Streaming 시작
             isStreamingMode = true;
             accumulatedText = "";
             currentPartial = "";
-            resultText.text = "";
+            if (resultText != null) resultText.text = "";
 
-            // Recording 버튼 비활성화
-            recordButton.interactable = false;
+            if (recordButton != null) recordButton.interactable = false;
 
             STTManager.Instance.StartListening(languageCode);
-            statusText.text = "🎙️ 스트리밍 시작...";
+            if (statusText != null) statusText.text = "🎙️ 스트리밍 시작...";
         }
         else
         {
-            // Streaming 종료
             isStreamingMode = false;
             STTManager.Instance.StopListening();
 
-            // Recording 버튼 활성화
-            recordButton.interactable = true;
-            statusText.text = "스트리밍 종료";
+            if (recordButton != null) recordButton.interactable = true;
+            if (statusText != null) statusText.text = "스트리밍 종료";
         }
 
         UpdateButtonTexts();
@@ -205,33 +244,29 @@ public class STTTestCode : MonoBehaviour
     {
         if (!hasPermission || !isInitialized)
         {
-            statusText.text = "초기화 필요";
+            if (statusText != null) statusText.text = "초기화 필요";
             return;
         }
 
         if (!isRecording)
         {
-            // Recording 시작
             isRecording = true;
             accumulatedText = "";
             currentPartial = "";
-            resultText.text = "";
+            if (resultText != null) resultText.text = "";
 
-            // Streaming 버튼 비활성화
-            streamingButton.interactable = false;
+            if (streamingButton != null) streamingButton.interactable = false;
 
             STTManager.Instance.StartListening(languageCode);
-            statusText.text = "🔴 녹음 중... (버튼을 눌러 종료)";
+            if (statusText != null) statusText.text = "🔴 녹음 중... (버튼을 눌러 종료)";
         }
         else
         {
-            // Recording 종료 & STT 변환
             isRecording = false;
             STTManager.Instance.StopListening();
 
-            // Streaming 버튼 활성화
-            streamingButton.interactable = true;
-            statusText.text = "변환 완료";
+            if (streamingButton != null) streamingButton.interactable = true;
+            if (statusText != null) statusText.text = "변환 완료";
 
             Debug.Log($"[STT] 최종 결과: {accumulatedText}");
         }
@@ -241,18 +276,31 @@ public class STTTestCode : MonoBehaviour
 
     private void UpdateButtonTexts()
     {
-        var streamingText = streamingButton.GetComponentInChildren<TMP_Text>();
-        var recordText = recordButton.GetComponentInChildren<TMP_Text>();
+        if (streamingButton != null)
+        {
+            var streamingText = streamingButton.GetComponentInChildren<TMP_Text>();
+            if (streamingText != null)
+                streamingText.text = isStreamingMode ? "⏹ 스트리밍 중지" : "🎙️ 스트리밍";
+        }
 
-        if (streamingText != null)
-            streamingText.text = isStreamingMode ? "⏹ 스트리밍 중지" : "🎙️ 스트리밍";
-
-        if (recordText != null)
-            recordText.text = isRecording ? "⏹ 녹음 종료" : "⏺ 녹음";
+        if (recordButton != null)
+        {
+            var recordText = recordButton.GetComponentInChildren<TMP_Text>();
+            if (recordText != null)
+                recordText.text = isRecording ? "⏹ 녹음 종료" : "⏺ 녹음";
+        }
     }
 
-    private void UpdateResultText()
+    private void UpdateResultText(bool force = false)
     {
+        if (resultText == null) return;
+
+        if (!force && uiUpdateThrottleSec > 0f)
+        {
+            if (Time.realtimeSinceStartup - _lastUiUpdateTime < uiUpdateThrottleSec)
+                return;
+        }
+
         string display = accumulatedText;
 
         if (!string.IsNullOrEmpty(currentPartial))
@@ -263,17 +311,26 @@ public class STTTestCode : MonoBehaviour
         }
 
         resultText.text = display;
+        _lastUiUpdateTime = Time.realtimeSinceStartup;
     }
 
     private void OnDestroy()
     {
+        if (_waitInitCo != null)
+        {
+            StopCoroutine(_waitInitCo);
+            _waitInitCo = null;
+        }
+
         if (STTManager.Instance != null)
         {
-            // 진행 중인 작업 중지
             if (isStreamingMode || isRecording)
-            {
                 STTManager.Instance.StopListening();
-            }
         }
+
+        UnsubscribeEvents();
+
+        if (streamingButton != null) streamingButton.onClick.RemoveListener(ToggleStreaming);
+        if (recordButton != null) recordButton.onClick.RemoveListener(ToggleRecording);
     }
 }
